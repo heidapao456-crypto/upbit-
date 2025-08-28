@@ -1,89 +1,123 @@
+import os
 import time
+import hmac
+import hashlib
 import requests
+import threading
+import numpy as np
+import pandas as pd
 
-# ===== 配置区 =====
-DISCORD_WEBHOOK = "https://discord.com/api/webhooks/1410605627549552660/irVKGqHysnuEWm0LTQ5MODk8OJh0iVziEjarfsnIJmWYE2nSUdrFBnq2PfZFZxM8LN-b"
-ETHERSCAN_API_KEY = "KBXFARN1ESDRM5GISP964FXRZP8QR1DUB8"
+# ================= 配置 =================
+# Discord Webhooks
+DISCORD_WEBHOOK_BINGX = "https://discord.com/api/webhooks/1410621268297912413/7d53-mjxPw0Az4y8TOeIWC7Axd4y9J3AsSwnGk93U93aATqkGXEXm_UROHpeTb8kTIwU"
+DISCORD_WEBHOOK_UPBIT = "https://discord.com/api/webhooks/1410605627549552660/irVKGqHysnuEWm0LTQ5MODk8OJh0iVziEjarfsnIJmWYE2nSUdrFBnq2PfZFZxM8LN-b"
 
-UPBIT_WALLETS_ETH = [
-    "0xe3792A9c235D434B702023b33F03C48C41631090",
-    "0xb4c93d3129f04a3d0f600ddccadb98c50e6e2619",
-    "0xba826fec90cefdf6706858e5fbafcb27a290fbe0",
-    "0x9a9c4219bb88918758ccf83928fa79a563031a16"
-]
+# BingX 配置
+BINGX_SYMBOLS = ["BTC-USDT", "ETH-USDT", "SOL-USDT"]  # 监控交易对
+INTERVALS = {"60": "1小时", "240": "4小时", "1440": "日线"}  # K线周期
+POLL_INTERVAL = 60  # 每60秒检查一次
 
-POLL_INTERVAL = 10  # 秒
-# ==================
+# Upbit 配置
+ETHERSCAN_API_KEY = "EDBDUQ59YZIIPTR4Z6C38TZR39TIENM3D5"
+UPBIT_WALLETS_ETH = ["0x59c5d1c13bfefe0f63f01f596f331d0b17b6c23f"]  # Upbit 钱包地址
+# ========================================
 
-seen_tokens = set()  # 已监控过的代币
 
-def send_discord_message(content: str):
+# ============ 工具函数 ============
+def send_discord_message(webhook_url: str, message: str):
     try:
-        res = requests.post(DISCORD_WEBHOOK, json={"content": content})
-        if res.status_code != 204:
-            print(f"❌ Discord 推送失败: {res.text}")
+        requests.post(webhook_url, json={"content": message}, timeout=5)
     except Exception as e:
-        print(f"❌ Discord 推送异常: {e}")
+        print("❌ Discord 发送失败:", e)
 
-def fetch_wallet_tokens(wallet: str):
-    """获取某个钱包最近代币交易"""
-    url = "https://api.etherscan.io/api"
-    params = {
-        "module": "account",
-        "action": "tokentx",
-        "address": wallet,
-        "page": 1,
-        "offset": 20,
-        "sort": "desc",
-        "apikey": ETHERSCAN_API_KEY
-    }
-    try:
-        res = requests.get(url, params=params, timeout=10)
-        data = res.json()
-        if data.get("status") == "1":
-            return data["result"]
-    except Exception as e:
-        print(f"⚠️ 获取交易失败 {wallet}: {e}")
-    return []
+# ============ BingX 监控 ============
+def fetch_bingx_klines(symbol: str, interval: str, limit: int = 100):
+    url = f"https://open-api.bingx.com/openApi/spot/v1/market/kline?symbol={symbol}&interval={interval}&limit={limit}"
+    r = requests.get(url, timeout=5).json()
+    data = r.get("data", [])
+    if not data:
+        return None
+    df = pd.DataFrame(data, columns=["openTime","open","high","low","close","volume","closeTime"])
+    df["close"] = df["close"].astype(float)
+    return df
 
-def fetch_upbit_markets():
-    """获取 Upbit 已上线的交易对"""
-    try:
-        url = "https://api.upbit.com/v1/market/all"
-        res = requests.get(url, timeout=10)
-        data = res.json()
-        markets = [m["market"] for m in data]  # 例: "KRW-BTC"
-        return markets
-    except Exception as e:
-        print(f"⚠️ 获取 Upbit 市场失败: {e}")
-        return []
+def compute_indicators(prices):
+    ema12 = prices.ewm(span=12).mean()
+    ema26 = prices.ewm(span=26).mean()
+    macd = ema12 - ema26
+    signal = macd.ewm(span=9).mean()
+    delta = prices.diff()
+    gain = np.where(delta > 0, delta, 0)
+    loss = np.where(delta < 0, -delta, 0)
+    avg_gain = pd.Series(gain).rolling(window=14).mean()
+    avg_loss = pd.Series(loss).rolling(window=14).mean()
+    rs = avg_gain / avg_loss
+    rsi = 100 - (100 / (1 + rs))
+    return ema12.iloc[-1], ema26.iloc[-1], macd.iloc[-1], signal.iloc[-1], rsi.iloc[-1]
 
-def monitor():
-    print("✅ Upbit Fast Listing Monitor started.")
+def monitor_bingx():
     while True:
-        markets = fetch_upbit_markets()
-        for wallet in UPBIT_WALLETS_ETH:
-            txs = fetch_wallet_tokens(wallet)
-            for tx in txs:
-                token_address = tx["contractAddress"]
-                token_symbol = tx["tokenSymbol"]
-                token_name = tx["tokenName"]
+        try:
+            for symbol in BINGX_SYMBOLS:
+                for interval, name in INTERVALS.items():
+                    df = fetch_bingx_klines(symbol, interval)
+                    if df is None: continue
+                    ema12, ema26, macd, signal, rsi = compute_indicators(df["close"])
 
-                if token_address not in seen_tokens:
-                    seen_tokens.add(token_address)
+                    price = df["close"].iloc[-1]
+                    message = None
 
-                    symbol_upper = token_symbol.upper()
-                    listed = any(symbol_upper in m for m in markets)
+                    if ema12 > ema26 and macd > signal and rsi < 70:
+                        message = f"🚨 BingX 多头信号\n交易对: {symbol}\n周期: {name}\n📈 BUY\n价格: {price:.2f}\nRSI: {rsi:.2f}\nMACD: {macd:.2f} vs {signal:.2f}"
 
-                    if listed:
-                        msg = f"✅ Upbit 已正式上线: {token_name} ({token_symbol})\n🔗 合约: {token_address}"
-                    else:
-                        msg = f"🚨 Upbit 热钱包发现新代币（可能即将上线）\n📌 代币: {token_name} ({token_symbol})\n🔗 合约: {token_address}\n💼 钱包: {wallet}"
+                    elif ema12 < ema26 and macd < signal and rsi > 30:
+                        message = f"🚨 BingX 空头信号\n交易对: {symbol}\n周期: {name}\n📉 SELL\n价格: {price:.2f}\nRSI: {rsi:.2f}\nMACD: {macd:.2f} vs {signal:.2f}"
 
-                    print(msg)
-                    send_discord_message(msg)
+                    if message:
+                        send_discord_message(DISCORD_WEBHOOK_BINGX, message)
 
-        time.sleep(POLL_INTERVAL)
+            time.sleep(POLL_INTERVAL)
 
+        except Exception as e:
+            print("❌ BingX 监控错误:", e)
+            time.sleep(10)
+
+# ============ Upbit 监控 ============
+def monitor_upbit():
+    last_tx = {addr: None for addr in UPBIT_WALLETS_ETH}
+    while True:
+        try:
+            for addr in UPBIT_WALLETS_ETH:
+                url = f"https://api.etherscan.io/api?module=account&action=txlist&address={addr}&sort=desc&apikey={ETHERSCAN_API_KEY}"
+                r = requests.get(url, timeout=5).json()
+                txs = r.get("result", [])
+                if not txs: continue
+                latest = txs[0]["hash"]
+
+                if last_tx[addr] != latest:
+                    last_tx[addr] = latest
+                    value = int(txs[0]["value"]) / 1e18
+                    to_addr = txs[0]["to"]
+                    send_discord_message(
+                        DISCORD_WEBHOOK_UPBIT,
+                        f"🚨 Upbit 钱包新交易\n地址: {addr}\n交易哈希: {latest}\n数量: {value:.4f} ETH\nTo: {to_addr}"
+                    )
+
+            time.sleep(30)
+
+        except Exception as e:
+            print("❌ Upbit 监控错误:", e)
+            time.sleep(10)
+
+# ============ 主程序 ============
 if __name__ == "__main__":
-    monitor()
+    t1 = threading.Thread(target=monitor_bingx, daemon=True)
+    t2 = threading.Thread(target=monitor_upbit, daemon=True)
+
+    t1.start()
+    t2.start()
+
+    print("✅ BingX & Upbit 监控器已启动，正在运行中...")
+
+    while True:
+        time.sleep(60)
